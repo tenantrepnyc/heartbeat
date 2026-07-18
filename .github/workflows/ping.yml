@@ -1,0 +1,52 @@
+name: ping
+
+on:
+  schedule:
+    # two offset expressions -> every 5 min, avoiding :00 congestion drops
+    - cron: "1,11,21,31,41,51 * * * *"
+    - cron: "6,16,26,36,46,56 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ping
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      # Each honored run pings several times over ~4.5 min to widen coverage
+      # when GitHub's scheduler fires sparsely.
+      - name: Ping
+        run: |
+          set -uo pipefail
+          for i in 1 2 3 4; do
+            echo "ping $i at $(date -u +%H:%M:%SZ)"
+            curl -fsS --max-time 120 \
+              -H "Authorization: Bearer ${{ secrets.PING_TOKEN }}" \
+              "${{ secrets.PING_URL }}" | head -c 1000 || echo "(ping $i failed, continuing)"
+            echo
+            [ "$i" -lt 4 ] && sleep 90 || true
+          done
+      # GitHub disables schedules after 60 days without repo activity;
+      # push an empty keepalive commit when the last one is >20 days old.
+      - name: Keepalive
+        run: |
+          set -uo pipefail
+          git clone --depth 2 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ka
+          cd ka
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          if [ $(( NOW - LAST )) -gt 1728000 ]; then
+            git config user.name "keepalive"
+            git config user.email "keepalive@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push origin HEAD
+            echo "keepalive commit pushed"
+          else
+            echo "repo active $(( (NOW - LAST) / 86400 ))d ago, no keepalive needed"
+          fi
