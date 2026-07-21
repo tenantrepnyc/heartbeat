@@ -50,3 +50,28 @@ jobs:
           else
             echo "repo active $(( (NOW - LAST) / 86400 ))d ago, no keepalive needed"
           fi
+
+  # REOS cron-dispatch backstop (moved here 2026-07-21 from the private
+  # repo's reos-cron workflow, which is billing-blocked: private-repo Actions
+  # minutes are metered and the account's spending limit halts them; this
+  # repo is public = free minutes). The dispatch endpoint is the same
+  # in-app round-robin the every-minute Vercel outbox drains already drive —
+  # this job is pure INSURANCE for Vercel cron outages, which the operator
+  # has observed. Redis SET NX claims inside the dispatcher make overlapping
+  # invocations no-ops, so the extra cadence is harmless.
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Hit the REOS dispatch endpoint
+        run: |
+          set -uo pipefail
+          for i in 1 2; do
+            echo "dispatch attempt $i at $(date -u +%H:%M:%SZ)"
+            curl -fsS --max-time 120 \
+              -H "Authorization: Bearer ${{ secrets.REOS_DISPATCH_SECRET }}" \
+              "https://reos-crm.vercel.app/api/command-center/cron/dispatch" \
+              | head -c 1000 || echo "(dispatch attempt $i failed, continuing)"
+            echo
+            [ "$i" -lt 2 ] && sleep 60 || true
+          done
