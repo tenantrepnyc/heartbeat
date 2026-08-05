@@ -8,70 +8,60 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
-concurrency:
-  group: ping
-  cancel-in-progress: false
-
+# NO workflow-level concurrency, and NO in-run sleep loops. Both used to be here
+# and together they defeated the schedule this file asks for:
+#
+#   the ping job looped 4 curls with 90s sleeps and then CLONED the repo for the
+#   keepalive check, so one run took 5-12 minutes. Against a 5-minute schedule
+#   plus `concurrency: group: ping` that is guaranteed overlap, and GitHub
+#   resolves overlap by CANCELLING the queued run. Observed 2026-08-05: a
+#   workflow written for every 5 minutes was really firing in pairs about every
+#   2 HOURS, the four most recent runs all "cancelled" — at the same time REOS's
+#   PRIMARY scheduler (the Mac poller on the macOS VPS) was gone, because the
+#   VPS itself had been cancelled. Net effect: nothing scheduled ran in REOS for
+#   hours, and no alert could reach the operator, because the alert channel is
+#   iMessage on that same dead VPS.
+#
+# Runs are now single-shot and finish well inside a minute, so consecutive
+# 5-minute firings never collide. Any overlap that does slip through is
+# harmless: the dispatcher claims each route in Redis with SET NX for that
+# route's cadence, so a second concurrent invocation is a no-op. Keepalive moved
+# to keepalive.yml, so the repo-clone cost is paid every 10 days, not every run.
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 5
     steps:
-      # Each honored run pings several times over ~4.5 min to widen coverage
-      # when GitHub's scheduler fires sparsely.
       - name: Ping
         run: |
           set -uo pipefail
-          for i in 1 2 3 4; do
-            echo "ping $i at $(date -u +%H:%M:%SZ)"
-            curl -fsS --max-time 120 \
-              -H "Authorization: Bearer ${{ secrets.PING_TOKEN }}" \
-              "${{ secrets.PING_URL }}" | head -c 1000 || echo "(ping $i failed, continuing)"
-            echo
-            [ "$i" -lt 4 ] && sleep 90 || true
-          done
-      # GitHub disables schedules after 60 days without repo activity;
-      # push an empty keepalive commit when the last one is >20 days old.
-      - name: Keepalive
-        run: |
-          set -uo pipefail
-          git clone --depth 2 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" ka
-          cd ka
-          LAST=$(git log -1 --format=%ct)
-          NOW=$(date +%s)
-          if [ $(( NOW - LAST )) -gt 1728000 ]; then
-            git config user.name "keepalive"
-            git config user.email "keepalive@users.noreply.github.com"
-            git commit --allow-empty -m "keepalive"
-            git push origin HEAD
-            echo "keepalive commit pushed"
-          else
-            echo "repo active $(( (NOW - LAST) / 86400 ))d ago, no keepalive needed"
-          fi
+          curl -fsS --max-time 240 \
+            -H "Authorization: Bearer ${{ secrets.PING_TOKEN }}" \
+            "${{ secrets.PING_URL }}" | head -c 1000 || echo "(ping failed)"
+          echo
 
-  # REOS cron-dispatch backstop (moved here 2026-07-21 from the private
-  # repo's reos-cron workflow, which is billing-blocked: private-repo Actions
-  # minutes are metered and the account's spending limit halts them; this
-  # repo is public = free minutes). The dispatch endpoint is the same
-  # in-app round-robin the every-minute Vercel outbox drains already drive —
-  # this job is pure INSURANCE for Vercel cron outages, which the operator
-  # has observed. Redis SET NX claims inside the dispatcher make overlapping
-  # invocations no-ops, so the extra cadence is harmless.
+  # REOS cron-dispatch backstop (moved here 2026-07-21 from the private repo's
+  # reos-cron workflow, which is billing-blocked: private-repo Actions minutes
+  # are metered and the account's spending limit halts them; this repo is public
+  # = free minutes). Do NOT move it back to the private repo.
+  #
+  # /cron/dispatch fans out to everything time-based: email sync, the iMessage
+  # monitor, canary, keepalive, both outbox drains, follow-up auto-send, and the
+  # Intelius queue drain. It dispatches only 3 routes per tick, round-robin over
+  # ~25 routes, so the cadence here sets how fast the whole system turns over:
+  # every 5 min => full coverage in ~40 min. The 60s Mac poller gave ~8 min, so
+  # this is insurance, not a replacement — restore the poller on the Mac mini.
   dispatch:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - name: Hit the REOS dispatch endpoint
         run: |
           set -uo pipefail
-          for i in 1 2; do
-            echo "dispatch attempt $i at $(date -u +%H:%M:%SZ)"
-            curl -fsS --max-time 120 \
-              -H "Authorization: Bearer ${{ secrets.REOS_DISPATCH_SECRET }}" \
-              "https://reos-crm.vercel.app/api/command-center/cron/dispatch" \
-              | head -c 1000 || echo "(dispatch attempt $i failed, continuing)"
-            echo
-            [ "$i" -lt 2 ] && sleep 60 || true
-          done
+          curl -fsS --max-time 240 \
+            -H "Authorization: Bearer ${{ secrets.REOS_DISPATCH_SECRET }}" \
+            "https://reos-crm.vercel.app/api/command-center/cron/dispatch" \
+            | head -c 1000 || echo "(dispatch failed)"
+          echo

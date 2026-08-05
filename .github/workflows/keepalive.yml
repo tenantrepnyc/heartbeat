@@ -1,0 +1,38 @@
+name: keepalive
+
+# GitHub disables a repo's scheduled workflows after 60 days with no repo
+# activity — which would silently kill the REOS cron backstop in ping.yml.
+# This used to be a step inside every ping run, where its repo clone was the
+# main reason a run took long enough to collide with the 5-minute schedule and
+# get cancelled. It only needs to happen every few weeks, so it lives here.
+on:
+  schedule:
+    - cron: "0 12 */10 * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Push an empty commit if the repo has gone quiet
+        run: |
+          set -uo pipefail
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          # 20 days, comfortably inside GitHub's 60-day window.
+          if [ $(( NOW - LAST )) -gt 1728000 ]; then
+            git config user.name "keepalive"
+            git config user.email "keepalive@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push origin HEAD
+            echo "keepalive commit pushed"
+          else
+            echo "repo active $(( (NOW - LAST) / 86400 ))d ago, no keepalive needed"
+          fi
